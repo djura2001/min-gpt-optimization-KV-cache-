@@ -18,6 +18,15 @@ from mingpt.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
 
+class KVCache:
+    def __init__(self, K, V):
+        self.K_cache = K
+        self.V_cache = V
+        
+    def add_cache(self, K, V):
+        self.K_cache = torch.cat([self.K_cache ,K], dim = 1)
+        self.V_cache = torch.cat([self.V_cache, V], dim = 1)
+        
 class NewGELU(nn.Module):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
@@ -26,7 +35,7 @@ class NewGELU(nn.Module):
     def forward(self, x):
         return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttentionVanilla(nn.Module):
     """
     A vanilla multi-head masked self-attention layer with a projection at the end.
     It is possible to use torch.nn.MultiheadAttention here but I am including an
@@ -68,15 +77,66 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y,k,v,q
+    
+class CausalSelfAttention(CausalSelfAttentionVanilla):
+    """
+    A vanilla multi-head masked self-attention layer with a projection at the end.
+    It is possible to use torch.nn.MultiheadAttention here but I am including an
+    explicit implementation here to show that there is nothing too scary here.
+    """
+
+    def __init__(self, config):
+        super().__init__(config=config)
+        self.k_cache = None
+        self.v_cache = None  
+
+    def forward(self, x, K_cache = None, V_cache = None):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        if self.k_cache is None or self.v_cache is None:
+            self.k_cache = k
+            self.v_cache = v
+        else:
+    
+            self.k_cache = torch.cat([self.k_cache, k], dim = 2)
+            self.v_cache = torch.cat([self.v_cache, v], dim = 2)
+        k = self.k_cache
+        v = self.v_cache
+
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = att.masked_fill(self.bias[:,:,:T,:k.size(2)] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y,k,v,q
+
+
+        
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
-    def __init__(self, config):
+    def __init__(self, config, vanilla):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        if vanilla == False:
+            self.attn = CausalSelfAttention(config)
+        else:
+            self.attn = CausalSelfAttentionVanilla(config)
+        self.attn_vanilla = CausalSelfAttentionVanilla(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = nn.ModuleDict(dict(
             c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
@@ -87,8 +147,14 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x , K_cache = None, V_cache = None):
+        '''if K_cache == None:
+            att_x, K_new, V_new = self.attn(self.ln_1(x))
+        else:
+            att_x, K_new, V_new = self.attn(self.ln_1(x), K_cache, V_cache)'''
+        van_att_x,vank,vanv,vanq = self.attn_vanilla(self.ln_1(x))
+        att_x,k,v,q = self.attn(self.ln_1(x))
+        x = x + att_x
         x = x + self.mlpf(self.ln_2(x))
         return x
 
@@ -112,8 +178,9 @@ class GPT(nn.Module):
         C.attn_pdrop = 0.1
         return C
 
-    def __init__(self, config):
+    def __init__(self, config, vanilla=False):
         super().__init__()
+        self.vanilla = vanilla
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.block_size = config.block_size
@@ -145,11 +212,13 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.embd_pdrop),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, self.vanilla) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+        self.num_layers = config.n_layer
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
+        self.K_cache = []
+        self.V_cache = []
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -172,7 +241,7 @@ class GPT(nn.Module):
             torch.nn.init.ones_(module.weight)
 
     @classmethod
-    def from_pretrained(cls, model_type):
+    def from_pretrained(cls, model_type ,vanilla = False):
         """
         Initialize a pretrained GPT model by copying over the weights
         from a huggingface/transformers checkpoint.
@@ -185,20 +254,27 @@ class GPT(nn.Module):
         config.model_type = model_type
         config.vocab_size = 50257 # openai's model vocabulary
         config.block_size = 1024  # openai's model block_size
-        model = GPT(config)
+        model = GPT(config, vanilla)
         sd = model.state_dict()
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')] # ignore these
+        # Koristi samo ključeve koji postoje u HuggingFace checkpointu
+        keys = [k for k in sd_hf if not k.endswith('attn.masked_bias')]
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla nn.Linear.
-        # this means that we have to transpose these weights when we import them
-        assert len(keys) == len(sd)
+        
+        print(f"MinGPT model has: {len(sd)} parameters")
+        print(f"HuggingFace checkpoint has: {len(sd_hf)} parameters")
+        print(f"Keys to copy: {len(keys)}")
+        
+        # Kopiraj samo parametre koji postoje u oba modela
         for k in keys:
+            if k not in sd:
+                print(f"Warning: {k} not in minGPT model, skipping")
+                continue
+                
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
@@ -211,6 +287,11 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+    def reset_kv_cache(self):
+        for block in self.transformer.h:
+            att = block.attn
+            att.k_cache = None
+            att.v_cache = None
 
     def configure_optimizers(self, train_config):
         """
@@ -257,22 +338,41 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, kv_cached, num_tokens= None, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-
+        if not kv_cached:
+            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        else:
+            seq = num_tokens  # broj tokena do sada, od 1..N
+            pos_index = (seq - 1)   # da ne prelazi limit
+            pos = torch.tensor([[pos_index]], dtype=torch.long, device=device)
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        '''if not kv_cached:
+            
+            for block in self.transformer.h:
+                x, K_i, V_i = block(x)
+                self.K_cache.append(K_i)
+                self.V_cache.append(V_i)
+                #for prefill and all the prompt tokens we generate the the K and V for each layer and the first predicted token 
+        else:
+            for i , block in enumerate(self.transformer.h):
+                x, K_i, V_i = block(x, self.K_cache[i], self.V_cache[i])
+                #self.K_cache[i] = torch.cat([self.K_cache[i], K_i], dim = 1)
+                #self.V_cache[i] = torch.cat([self.V_cache[i], V_i], dim = 1)
+                self.K_cache[i] = K_i
+                self.V_cache[i] = V_i
+                # to each layers cache we append the new token K and V values'''
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
-        # if we are given some desired targets also calculate the loss
+        # if we are given some desired targets also calculate the loss)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
@@ -286,11 +386,46 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        if self.vanilla == False:
+            self.reset_kv_cache()
+            #PREFILL
+            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            #logits, _  = self(idx_cond)
+            logits, _  = self(idx_cond, False)
+            
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # either sample from the distribution or take the most likely element
+            if do_sample:
+                idx_next = torch.multinomial(probs, num_samples=1)
+            else:
+                _, idx_next = torch.topk(probs, k=1, dim=-1)
+            
+            idx = torch.cat((idx, idx_next), dim=1)
+            num_tokens = idx.size(1)
+            max_new_tokens = max_new_tokens - 1
+
+        #DECODING
+        
         for _ in range(max_new_tokens):
+            if not self.vanilla:
+                num_tokens +=1
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            if self.vanilla == False:
+                logits, _ = self(idx_next, True, num_tokens) 
+            else:
+                logits, _ = self(idx, False) 
+            #logits, _ = self(idx_next, num_tokens) 
+            
+            
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -308,3 +443,5 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+    
+
