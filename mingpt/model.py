@@ -69,7 +69,10 @@ class CausalSelfAttentionVanilla(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        T_q = q.size(2)
+        T_k = k.size(2)
+        att = att.masked_fill(self.bias[:, :, T_k - T_q:T_k, :T_k] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -110,13 +113,17 @@ class CausalSelfAttention(CausalSelfAttentionVanilla):
         v = self.v_cache
 
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # causal self-attention; Self-attend: (B, nh, Tq, hs) x (B, nh, hs, Tk) -> (B, nh, Tq, Tk)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = att.masked_fill(self.bias[:,:,:T,:k.size(2)] == 0, float('-inf'))
+        # When keys include cached previous tokens, k.size(2) may be > T.
+        # We need the bias rows corresponding to the absolute positions of the queries,
+        # which are the last `T` rows relative to the current cached key length.
+        T_q = q.size(2)
+        T_k = k.size(2)
+        att = att.masked_fill(self.bias[:, :, T_k - T_q:T_k, :T_k] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = att @ v # (B, nh, Tq, Tk) x (B, nh, Tk, hs) -> (B, nh, Tq, hs), where Tq == T
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -414,15 +421,17 @@ class GPT(nn.Module):
         #DECODING
         
         for _ in range(max_new_tokens):
-            if not self.vanilla:
-                num_tokens +=1
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
+            # When using KV-caching we pass only the newly generated token (`idx_next`) and
+            # the current total `num_tokens` (so forward will place the token at position num_tokens-1).
+            # Do NOT increment `num_tokens` before calling the forward pass; increment it after
+            # we append the generated token to `idx`.
             if self.vanilla == False:
-                logits, _ = self(idx_next, True, num_tokens) 
+                logits, _ = self(idx_next, True, num_tokens)
             else:
-                logits, _ = self(idx, False) 
+                logits, _ = self(idx, False)
             #logits, _ = self(idx_next, num_tokens) 
             
             
@@ -441,6 +450,10 @@ class GPT(nn.Module):
                 _, idx_next = torch.topk(probs, k=1, dim=-1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
+            # increment token count after appending the new token so future position indices
+            # match the actual sequence length
+            if not self.vanilla:
+                num_tokens += 1
 
         return idx
     
