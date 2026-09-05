@@ -18,15 +18,6 @@ from mingpt.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
 
-class KVCache:
-    def __init__(self, K, V):
-        self.K_cache = K
-        self.V_cache = V
-        
-    def add_cache(self, K, V):
-        self.K_cache = torch.cat([self.K_cache ,K], dim = 1)
-        self.V_cache = torch.cat([self.V_cache, V], dim = 1)
-        
 class NewGELU(nn.Module):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
@@ -143,7 +134,6 @@ class Block(nn.Module):
             self.attn = CausalSelfAttention(config)
         else:
             self.attn = CausalSelfAttentionVanilla(config)
-        self.attn_vanilla = CausalSelfAttentionVanilla(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = nn.ModuleDict(dict(
             c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd),
@@ -154,13 +144,8 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x , K_cache = None, V_cache = None):
-        '''if K_cache == None:
-            att_x, K_new, V_new = self.attn(self.ln_1(x))
-        else:
-            att_x, K_new, V_new = self.attn(self.ln_1(x), K_cache, V_cache)'''
-        van_att_x,vank,vanv,vanq = self.attn_vanilla(self.ln_1(x))
-        att_x,k,v,q = self.attn(self.ln_1(x))
+    def forward(self, x):
+        att_x, k, v, q = self.attn(self.ln_1(x))
         x = x + att_x
         x = x + self.mlpf(self.ln_2(x))
         return x
@@ -224,8 +209,6 @@ class GPT(nn.Module):
         ))
         self.num_layers = config.n_layer
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.K_cache = []
-        self.V_cache = []
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -300,6 +283,11 @@ class GPT(nn.Module):
             att.k_cache = None
             att.v_cache = None
 
+    def rollback_kv_cache(self, n):
+        for block in self.transformer.h:
+            block.attn.k_cache = block.attn.k_cache[:, :, :n, :]
+            block.attn.v_cache = block.attn.v_cache[:, :, :n, :]
+
     def configure_optimizers(self, train_config):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
@@ -345,35 +333,21 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, kv_cached, num_tokens= None, targets=None):
+    def forward(self, idx, kv_cached, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
-        if not kv_cached:
-            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-        else:
-            seq = num_tokens  # broj tokena do sada, od 1..N
-            pos_index = (seq - 1)   # da ne prelazi limit
-            pos = torch.tensor([[pos_index]], dtype=torch.long, device=device)
+        past_len = 0
+        if kv_cached and self.transformer.h[0].attn.k_cache is not None:
+            past_len = self.transformer.h[0].attn.k_cache.size(2)
+        assert past_len + t <= self.block_size, (
+            f"KV cache exceeded block_size ({past_len + t} > {self.block_size}); "
+            f"sliding window is not implemented, this is a documented limitation"
+        )
+        pos = torch.arange(past_len, past_len + t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        '''if not kv_cached:
-            
-            for block in self.transformer.h:
-                x, K_i, V_i = block(x)
-                self.K_cache.append(K_i)
-                self.V_cache.append(V_i)
-                #for prefill and all the prompt tokens we generate the the K and V for each layer and the first predicted token 
-        else:
-            for i , block in enumerate(self.transformer.h):
-                x, K_i, V_i = block(x, self.K_cache[i], self.V_cache[i])
-                #self.K_cache[i] = torch.cat([self.K_cache[i], K_i], dim = 1)
-                #self.V_cache[i] = torch.cat([self.V_cache[i], V_i], dim = 1)
-                self.K_cache[i] = K_i
-                self.V_cache[i] = V_i
-                # to each layers cache we append the new token K and V values'''
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -398,9 +372,8 @@ class GPT(nn.Module):
             #PREFILL
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            #logits, _  = self(idx_cond)
             logits, _  = self(idx_cond, False)
-            
+
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
@@ -415,26 +388,21 @@ class GPT(nn.Module):
                 _, idx_next = torch.topk(probs, k=1, dim=-1)
             
             idx = torch.cat((idx, idx_next), dim=1)
-            num_tokens = idx.size(1)
             max_new_tokens = max_new_tokens - 1
 
         #DECODING
-        
+
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            # When using KV-caching we pass only the newly generated token (`idx_next`) and
-            # the current total `num_tokens` (so forward will place the token at position num_tokens-1).
-            # Do NOT increment `num_tokens` before calling the forward pass; increment it after
-            # we append the generated token to `idx`.
+            # When using KV-caching we pass only the newly generated token (`idx_next`);
+            # its position is derived inside forward() from the cache length.
             if self.vanilla == False:
-                logits, _ = self(idx_next, True, num_tokens)
+                logits, _ = self(idx_next, True)
             else:
                 logits, _ = self(idx, False)
-            #logits, _ = self(idx_next, num_tokens) 
-            
-            
+
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -450,10 +418,6 @@ class GPT(nn.Module):
                 _, idx_next = torch.topk(probs, k=1, dim=-1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-            # increment token count after appending the new token so future position indices
-            # match the actual sequence length
-            if not self.vanilla:
-                num_tokens += 1
 
         return idx
     
