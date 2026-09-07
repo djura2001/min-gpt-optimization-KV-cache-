@@ -102,6 +102,61 @@ class TestSpeculativeDraftSizeGuard(unittest.TestCase):
             target.generate_speculative(same_size_draft, prompt, max_new_tokens=5, gamma=2, do_sample=False)
 
 
+class TestSpeculativeDraftCacheInvariant(unittest.TestCase):
+    """Regression test for the draft-KV-cache-one-token-short-after-full-acceptance
+    bug (prompt_alpha_and_cache_fixes.md, Problem 1). A single round can't expose
+    this: the drift only shows up on the round AFTER a fully-accepted block, so this
+    forces multiple rounds with guaranteed full agreement on every round.
+
+    Uses a deepcopy of the target as the draft (identical weights -> deterministic
+    full acceptance at every tested position, since draft and target compute the
+    exact same greedy argmax given the same prefix) with independent cache tensors
+    (unlike passing the same object as both target and draft, which would alias the
+    two caches together and defeat the point of isolating the draft's own bookkeeping).
+    """
+
+    def test_draft_cache_length_after_full_acceptance_round(self):
+        import copy
+
+        target = make_toy('gpt-micro', vanilla=False)
+        draft = copy.deepcopy(target)
+
+        torch.manual_seed(0)
+        prompt = torch.randint(0, VOCAB_SIZE, (1, PROMPT_LEN))
+        gamma = 3
+        # 9 = 1 (prefill) + 4 (round 1: 3 accepted + bonus) + 4 (round 2: 3 accepted + bonus),
+        # chosen so both rounds end normally (bonus token committed) rather than hitting the
+        # overshoot-drop branch -- that branch commits only the accepted prefix with no bonus,
+        # so the draft cache legitimately ends up fully caught up (lag 0) instead of lag-1 there,
+        # which would make the generic invariant checked below the wrong expectation.
+        max_new_tokens = 9
+
+        ref = target.generate(prompt.clone(), max_new_tokens=max_new_tokens, do_sample=False)
+        spec, stats = target.generate_speculative(
+            draft, prompt.clone(), max_new_tokens=max_new_tokens, gamma=gamma,
+            do_sample=False, return_stats=True, _skip_size_guard=True,
+        )
+
+        # output correctness must hold regardless of this bug -- the target verifies
+        # independently of the draft's (possibly corrupted) internal state
+        self.assertTrue(torch.equal(ref, spec))
+
+        # this test's own premise: identical draft/target must fully accept every
+        # proposed token (no disagreement is possible with identical greedy models)
+        self.assertEqual(stats['accepted'], stats['proposed'],
+                          "test setup assumption violated: identical draft/target should "
+                          "fully accept every proposed token")
+
+        # the actual regression check: the draft cache must maintain the same
+        # "lags idx by exactly 1" invariant the target cache and generate() maintain,
+        # not drift short after full-acceptance rounds
+        final_len = spec.size(1)
+        draft_cache_len = draft.transformer.h[0].attn.k_cache.size(2)
+        self.assertEqual(draft_cache_len, final_len - 1,
+                          f"draft cache length {draft_cache_len} != expected {final_len - 1} "
+                          f"-- draft cache is drifting short after full-acceptance rounds")
+
+
 class TestSpeculativeIdentityGPT2(unittest.TestCase):
     """Same identity check on real trained weights (gpt2 draft / gpt2-medium target).
     Requires the gpt2 and gpt2-medium checkpoints to be resolvable via huggingface_hub

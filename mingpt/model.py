@@ -285,6 +285,11 @@ class GPT(nn.Module):
 
     def rollback_kv_cache(self, n):
         for block in self.transformer.h:
+            cur_len = block.attn.k_cache.size(2)
+            assert cur_len >= n, (
+                f"rollback to {n} requested but cache is only {cur_len} long; "
+                f"rollback can only shorten a cache, never extend it"
+            )
             block.attn.k_cache = block.attn.k_cache[:, :, :n, :]
             block.attn.v_cache = block.attn.v_cache[:, :, :n, :]
 
@@ -441,7 +446,8 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate_speculative(self, draft_model, idx, max_new_tokens, gamma,
-                              temperature=1.0, do_sample=False, top_k=None, return_stats=False):
+                              temperature=1.0, do_sample=False, top_k=None, return_stats=False,
+                              _skip_size_guard=False):
         """
         Speculative decoding, Phase A (greedy). `self` is the target model.
         Draft proposes `gamma` tokens (with its own KV cache if draft_model.vanilla is
@@ -451,18 +457,26 @@ class GPT(nn.Module):
         draft was accepted). Batch size 1 only. Stochastic acceptance (Phase B) is not
         implemented; do_sample must be False here.
 
-        If return_stats is True, returns (idx, stats) where stats is a dict with
-        'proposed', 'accepted' (summed over all rounds) and 'alpha' = accepted/proposed,
-        for measuring the empirical acceptance rate.
+        If return_stats is True, returns (idx, stats) where stats is a dict; see the
+        `return_stats` block at the end of this method for the exact keys and what each
+        one means (in particular: 'alpha' is kept only for backward compatibility and is
+        NOT the conditional acceptance probability the analytical speedup formula wants
+        -- use 'alpha_conditional' for that).
+
+        `_skip_size_guard` is test-only: it bypasses the draft-smaller-than-target
+        assertion so a test can force deterministic full agreement (e.g. an identical
+        deepcopy as the draft) to exercise multi-round behavior without depending on
+        real model disagreement. Never set this outside tests.
         """
         assert idx.size(0) == 1, "speculative decoding only supports batch size 1"
         assert not do_sample, "stochastic acceptance (Phase B) is not implemented yet"
         assert gamma >= 1
-        n_target, n_draft = self._count_params(self), self._count_params(draft_model)
-        assert n_draft < n_target, (
-            f"draft model ({n_draft/1e6:.1f}M params) is not smaller than "
-            f"target ({n_target/1e6:.1f}M params)"
-        )
+        if not _skip_size_guard:
+            n_target, n_draft = self._count_params(self), self._count_params(draft_model)
+            assert n_draft < n_target, (
+                f"draft model ({n_draft/1e6:.1f}M params) is not smaller than "
+                f"target ({n_target/1e6:.1f}M params)"
+            )
 
         if not self.vanilla:
             self.reset_kv_cache()
@@ -489,6 +503,8 @@ class GPT(nn.Module):
         # --- speculative rounds ---
         total_proposed = 0
         total_accepted = 0
+        total_tested = 0
+        accepted_per_round = []
         while max_new_tokens > 0:
             g = min(gamma, max_new_tokens)
             L0 = idx.size(1)
@@ -536,8 +552,18 @@ class GPT(nn.Module):
             else:
                 extra = correction
 
+            # Positions that actually underwent the accept/reject test above: all
+            # accepted ones, plus the one that failed (if the round ended in a
+            # rejection rather than full acceptance). Positions after a rejection are
+            # never reached by the loop, so they must NOT be counted as tested -- doing
+            # so is exactly what made the old `alpha` an underestimate of the true
+            # per-token conditional acceptance probability, worsening as gamma grows
+            # even when that probability is constant (see prompt_alpha_and_cache_fixes.md).
+            tested_this_round = num_accepted + (1 if num_accepted < g else 0)
+            total_tested += tested_this_round
             total_proposed += g
             total_accepted += num_accepted
+            accepted_per_round.append(num_accepted)
 
             took = num_accepted + 1
             if took > max_new_tokens:
@@ -549,14 +575,48 @@ class GPT(nn.Module):
                 idx = torch.cat([idx, draft_tokens[:, :num_accepted], extra], dim=1)
             max_new_tokens -= took
 
+            if not draft_model.vanilla and correction is None:
+                # Full acceptance: the drafting loop above never fed d_g (the last
+                # drafted token) back into the draft model -- its final iteration used
+                # d_{g-1} as input and only ever READ d_g as output. So at this point
+                # the draft cache is exactly one token short of L0 + g. Left alone,
+                # rollback_kv_cache(L0 + num_accepted) below would silently no-op short
+                # (n > actual length), permanently desyncing the draft's cache from the
+                # running sequence -- corrupting its future proposals (and therefore the
+                # measured accept rate) while never affecting final output correctness,
+                # since the target verifies independently. Sync it before rolling back.
+                draft_model(draft_tokens[:, -1:], True)
             if not self.vanilla:
                 self.rollback_kv_cache(L0 + num_accepted)
             if not draft_model.vanilla:
                 draft_model.rollback_kv_cache(L0 + num_accepted)
 
         if return_stats:
-            alpha = total_accepted / total_proposed if total_proposed > 0 else float('nan')
-            stats = {'proposed': total_proposed, 'accepted': total_accepted, 'alpha': alpha}
+            # accepted_fraction: the old 'alpha' -- accepted / ALL proposed tokens, including
+            # ones a rejection meant were never actually tested. A legitimate descriptive
+            # measure of "how much draft work wasn't wasted", but NOT the quantity the
+            # analytical speedup formula (1-a^(g+1))/((1-a)(1+g*c)) expects.
+            accepted_fraction = total_accepted / total_proposed if total_proposed > 0 else float('nan')
+            # alpha_conditional: accepted / TESTED tokens only -- an estimate of the true
+            # per-token conditional acceptance probability. Use this one for the analytical
+            # formula and for Figure 3/4. See prompt_alpha_and_cache_fixes.md, Problem 2.
+            alpha_conditional = total_accepted / total_tested if total_tested > 0 else float('nan')
+            expected_accepted_per_round = (
+                sum(accepted_per_round) / len(accepted_per_round) if accepted_per_round else float('nan')
+            )
+            stats = {
+                'proposed': total_proposed,
+                'accepted': total_accepted,
+                'tested': total_tested,
+                'alpha_conditional': alpha_conditional,
+                'accepted_fraction': accepted_fraction,
+                'expected_accepted_per_round': expected_accepted_per_round,
+                'accepted_per_round': accepted_per_round,
+                'rounds': len(accepted_per_round),
+                # kept only for backward compatibility with existing call sites; this is
+                # accepted_fraction, NOT the analytical model's alpha -- see above.
+                'alpha': accepted_fraction,
+            }
             return idx, stats
         return idx
 
