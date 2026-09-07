@@ -148,3 +148,32 @@ This required restructuring cell order, not just patching values in place: `PROM
 Local validation: full `bench.ipynb` (47 cells) executes with zero errors as a CPU pipeline check. T_q scan now correctly measures `gpt2-medium` (median 0.055s at T_q=1, vs. the old and wrong `gpt2` measurement's 0.020s) and covers T_q=1..9. Cost ratio under matched `SPEC_PROMPT_LEN`/`SPEC_MAX_NEW_TOKENS` conditions came out to c=0.369 (previously 0.401 under unrelated default conditions — a different number for a legitimate reason, not noise). `mingpt/model.py` and the test suite were untouched this round (9/9 still passing, unaffected).
 
 **All speculative-decoding numbers and Figure 3 curves collected before this fix are invalid** — same standing requirement as the previous two passes.
+
+---
+
+## Addendum (2026-09-08): T4 GPU clock-ramp artifact in the T_q scan
+
+Running the restructured T_q scan on an actual Colab T4 surfaced a new issue this pass's local CPU validation couldn't catch (CPU has no DVFS ramp to expose). The scan tripped its own sanity assert:
+
+```
+T_q  time_median  time_min  time_max
+1    0.081268     0.037162  0.097064
+2    0.060613     0.019350  0.082303
+3    0.019870     0.019736  0.020655
+...
+9    0.018946     0.018656  0.020746
+AssertionError: T_q=9 was notably faster than T_q=1
+```
+
+Diagnosis: not a broken rollback. T_q=1 and T_q=2 show enormous variance (T_q=1 ranges 0.037s–0.097s across 5 reps — a ~2.6x spread), while T_q=3 onward is rock-solid (~0.0198–0.0199s, <5% spread). That pattern is the signature of a T4 still transitioning from idle to boost clock (DVFS) during the model's first few CUDA calls, not a property of T_q itself — and the existing per-T_q `n_warmup=3` doesn't help, because the ramp is a wall-clock/sustained-load phenomenon, not something a fixed small number of same-shape calls reliably clears.
+
+This is more than a failed assert: left uncorrected it would have biased `v_γ` itself. `t(T_q=1)` measured artificially high (still-ramping GPU) deflates every `v_γ = t(T_q=γ+1)/t(T_q=1)` ratio, which would have made the "v_γ-corrected" curve in Figure 3 look *more optimistic* than reality — exactly the kind of artifact that could have shipped a wrong headline number if it had gone unnoticed until the results were already in hand.
+
+### Fix
+
+Added a burn-in phase to `measure_tq_scan`, before any timed (or even warmup-labeled) measurement: on CUDA, run throwaway forward passes at the largest T_q shape for a fixed 1.5s of wall-clock time, discarding all output, so the GPU has ramped before anything is recorded. Also hardened the sanity check itself as a second line of defense: compares T_q=1 against the *median of the three largest T_q values* (not T_q=9 alone) with a more permissive ratio (0.5x, was 0.8x) — still enough to catch a genuinely broken rollback (which would show a qualitatively different, near-zero cost, not a 10-50% difference), but tolerant of whatever residual noise the burn-in doesn't fully absorb. If 1.5s isn't enough on some run, the assert message says to raise `burn_in_seconds` rather than failing silently.
+
+Local CPU re-validation (burn-in is CUDA-gated, so a no-op here, confirming the surrounding code didn't break): zero errors across all 47 cells, T_q scan output unaffected in shape.
+
+Re-run the T_q scan cell on Colab to confirm the burn-in resolves it before trusting `v_γ` for the final sweep.
+
