@@ -288,6 +288,10 @@ class GPT(nn.Module):
             block.attn.k_cache = block.attn.k_cache[:, :, :n, :]
             block.attn.v_cache = block.attn.v_cache[:, :, :n, :]
 
+    @staticmethod
+    def _count_params(model):
+        return sum(p.numel() for p in model.parameters())
+
     def configure_optimizers(self, train_config):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
@@ -420,5 +424,139 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-    
+
+    @staticmethod
+    def _apply_temp_topk(logits, temperature, do_sample, top_k):
+        # logits: (1, vocab). Applies temperature/top_k the same way generate() does,
+        # returns the greedy (do_sample=False) or sampled next-token id.
+        logits = logits.clone() / temperature
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[:, [-1]]] = -float('Inf')
+        probs = F.softmax(logits, dim=-1)
+        if do_sample:
+            return torch.multinomial(probs, num_samples=1)
+        _, idx_next = torch.topk(probs, k=1, dim=-1)
+        return idx_next
+
+    @torch.no_grad()
+    def generate_speculative(self, draft_model, idx, max_new_tokens, gamma,
+                              temperature=1.0, do_sample=False, top_k=None, return_stats=False):
+        """
+        Speculative decoding, Phase A (greedy). `self` is the target model.
+        Draft proposes `gamma` tokens (with its own KV cache if draft_model.vanilla is
+        False, else a full recompute each step); target verifies all gamma+1 positions
+        in a single forward pass and accepts the greedy prefix that agrees with the
+        draft, replacing the first disagreement (or emitting a bonus token if the whole
+        draft was accepted). Batch size 1 only. Stochastic acceptance (Phase B) is not
+        implemented; do_sample must be False here.
+
+        If return_stats is True, returns (idx, stats) where stats is a dict with
+        'proposed', 'accepted' (summed over all rounds) and 'alpha' = accepted/proposed,
+        for measuring the empirical acceptance rate.
+        """
+        assert idx.size(0) == 1, "speculative decoding only supports batch size 1"
+        assert not do_sample, "stochastic acceptance (Phase B) is not implemented yet"
+        assert gamma >= 1
+        n_target, n_draft = self._count_params(self), self._count_params(draft_model)
+        assert n_draft < n_target, (
+            f"draft model ({n_draft/1e6:.1f}M params) is not smaller than "
+            f"target ({n_target/1e6:.1f}M params)"
+        )
+
+        if not self.vanilla:
+            self.reset_kv_cache()
+        if not draft_model.vanilla:
+            draft_model.reset_kv_cache()
+
+        # --- step 0: target prefill over the prompt produces the first token, exactly
+        # as generate() would; draft prefill only needs to populate its own cache up to
+        # (but not including) that first generated token, maintaining the invariant
+        # that a cached model's KV cache always lags the running sequence by one token ---
+        prompt_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+        logits, _ = self(prompt_cond, not self.vanilla)
+        idx_next = self._apply_temp_topk(logits[:, -1, :], temperature, do_sample, top_k)
+        idx = torch.cat((idx, idx_next), dim=1)
+        max_new_tokens -= 1
+
+        if not draft_model.vanilla and max_new_tokens > 0:
+            prompt_cond_d = idx[:, :-1]
+            if prompt_cond_d.size(1) > draft_model.block_size:
+                prompt_cond_d = prompt_cond_d[:, -draft_model.block_size:]
+            if prompt_cond_d.size(1) > 0:
+                draft_model(prompt_cond_d, True)
+
+        # --- speculative rounds ---
+        total_proposed = 0
+        total_accepted = 0
+        while max_new_tokens > 0:
+            g = min(gamma, max_new_tokens)
+            L0 = idx.size(1)
+
+            # draft proposes g tokens
+            draft_tokens = []
+            cur = idx[:, -1:]
+            for _ in range(g):
+                if draft_model.vanilla:
+                    full = torch.cat([idx] + draft_tokens, dim=1) if draft_tokens else idx
+                    if full.size(1) > draft_model.block_size:
+                        full = full[:, -draft_model.block_size:]
+                    dlogits, _ = draft_model(full, False)
+                else:
+                    dlogits, _ = draft_model(cur, True)
+                dnext = self._apply_temp_topk(dlogits[:, -1, :], temperature, do_sample, top_k)
+                draft_tokens.append(dnext)
+                cur = dnext
+            draft_tokens = torch.cat(draft_tokens, dim=1)  # (1, g)
+
+            # target verifies all g+1 positions (last committed token + g draft tokens)
+            # in a single forward pass
+            if self.vanilla:
+                full_seq = torch.cat([idx, draft_tokens], dim=1)
+                if full_seq.size(1) > self.block_size:
+                    full_seq = full_seq[:, -self.block_size:]
+                vlogits, _ = self(full_seq, False)
+                verify_logits = vlogits[:, -(g + 1):, :]
+            else:
+                verify_in = torch.cat([idx[:, -1:], draft_tokens], dim=1)
+                verify_logits, _ = self(verify_in, True)
+
+            num_accepted = 0
+            correction = None
+            for i in range(g):
+                pick = self._apply_temp_topk(verify_logits[:, i, :], temperature, do_sample, top_k)
+                if pick.item() == draft_tokens[0, i].item():
+                    num_accepted += 1
+                else:
+                    correction = pick
+                    break
+
+            if correction is None:
+                extra = self._apply_temp_topk(verify_logits[:, g, :], temperature, do_sample, top_k)  # bonus token
+            else:
+                extra = correction
+
+            total_proposed += g
+            total_accepted += num_accepted
+
+            took = num_accepted + 1
+            if took > max_new_tokens:
+                # only reachable when g == max_new_tokens and every draft token was
+                # accepted; drop the bonus token so we don't overshoot the requested length
+                took = max_new_tokens
+                idx = torch.cat([idx, draft_tokens[:, :num_accepted]], dim=1)
+            else:
+                idx = torch.cat([idx, draft_tokens[:, :num_accepted], extra], dim=1)
+            max_new_tokens -= took
+
+            if not self.vanilla:
+                self.rollback_kv_cache(L0 + num_accepted)
+            if not draft_model.vanilla:
+                draft_model.rollback_kv_cache(L0 + num_accepted)
+
+        if return_stats:
+            alpha = total_accepted / total_proposed if total_proposed > 0 else float('nan')
+            stats = {'proposed': total_proposed, 'accepted': total_accepted, 'alpha': alpha}
+            return idx, stats
+        return idx
 
