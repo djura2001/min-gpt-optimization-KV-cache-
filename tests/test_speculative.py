@@ -77,7 +77,7 @@ class TestSpeculativeOvershootGuard(unittest.TestCase):
         torch.manual_seed(0)
         prompt = torch.randint(0, VOCAB_SIZE, (1, 6))
 
-        for max_new_tokens in [1, 2, 3, 4, 5]:
+        for max_new_tokens in [0, 1, 2, 3, 4, 5]:
             for gamma in [8, 16]:
                 with self.subTest(max_new_tokens=max_new_tokens, gamma=gamma):
                     ref = target.generate(prompt.clone(), max_new_tokens=max_new_tokens, do_sample=False)

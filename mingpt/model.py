@@ -170,7 +170,7 @@ class GPT(nn.Module):
         C.attn_pdrop = 0.1
         return C
 
-    def __init__(self, config, vanilla=False):
+    def __init__(self, config, vanilla=True):
         super().__init__()
         self.vanilla = vanilla
         assert config.vocab_size is not None
@@ -231,7 +231,7 @@ class GPT(nn.Module):
             torch.nn.init.ones_(module.weight)
 
     @classmethod
-    def from_pretrained(cls, model_type ,vanilla = False):
+    def from_pretrained(cls, model_type ,vanilla = True):
         """
         Initialize a pretrained GPT model by copying over the weights
         from a huggingface/transformers checkpoint.
@@ -342,7 +342,7 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, kv_cached, targets=None):
+    def forward(self, idx, targets=None, kv_cached=False):
         device = idx.device
         b, t = idx.size()
         past_len = 0
@@ -376,12 +376,15 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        if max_new_tokens <= 0:
+            return idx
+
         if self.vanilla == False:
             self.reset_kv_cache()
             #PREFILL
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _  = self(idx_cond, False)
+            logits, _  = self(idx_cond, kv_cached=False)
 
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -408,9 +411,9 @@ class GPT(nn.Module):
             # When using KV-caching we pass only the newly generated token (`idx_next`);
             # its position is derived inside forward() from the cache length.
             if self.vanilla == False:
-                logits, _ = self(idx_next, True)
+                logits, _ = self(idx_next, kv_cached=True)
             else:
-                logits, _ = self(idx, False)
+                logits, _ = self(idx_cond, kv_cached=False)
 
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
@@ -471,6 +474,15 @@ class GPT(nn.Module):
         assert idx.size(0) == 1, "speculative decoding only supports batch size 1"
         assert not do_sample, "stochastic acceptance (Phase B) is not implemented yet"
         assert gamma >= 1
+        if max_new_tokens <= 0:
+            if return_stats:
+                return idx, {
+                    'proposed': 0, 'accepted': 0, 'tested': 0,
+                    'alpha_conditional': float('nan'), 'accepted_fraction': float('nan'),
+                    'expected_accepted_per_round': float('nan'), 'accepted_per_round': [],
+                    'g_per_round': [], 'rounds': 0, 'alpha': float('nan'),
+                }
+            return idx
         if not _skip_size_guard:
             n_target, n_draft = self._count_params(self), self._count_params(draft_model)
             assert n_draft < n_target, (
@@ -488,7 +500,7 @@ class GPT(nn.Module):
         # (but not including) that first generated token, maintaining the invariant
         # that a cached model's KV cache always lags the running sequence by one token ---
         prompt_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
-        logits, _ = self(prompt_cond, not self.vanilla)
+        logits, _ = self(prompt_cond, kv_cached=not self.vanilla)
         idx_next = self._apply_temp_topk(logits[:, -1, :], temperature, do_sample, top_k)
         idx = torch.cat((idx, idx_next), dim=1)
         max_new_tokens -= 1
@@ -498,13 +510,14 @@ class GPT(nn.Module):
             if prompt_cond_d.size(1) > draft_model.block_size:
                 prompt_cond_d = prompt_cond_d[:, -draft_model.block_size:]
             if prompt_cond_d.size(1) > 0:
-                draft_model(prompt_cond_d, True)
+                draft_model(prompt_cond_d, kv_cached=True)
 
         # --- speculative rounds ---
         total_proposed = 0
         total_accepted = 0
         total_tested = 0
         accepted_per_round = []
+        g_per_round = []
         while max_new_tokens > 0:
             g = min(gamma, max_new_tokens)
             L0 = idx.size(1)
@@ -517,9 +530,9 @@ class GPT(nn.Module):
                     full = torch.cat([idx] + draft_tokens, dim=1) if draft_tokens else idx
                     if full.size(1) > draft_model.block_size:
                         full = full[:, -draft_model.block_size:]
-                    dlogits, _ = draft_model(full, False)
+                    dlogits, _ = draft_model(full, kv_cached=False)
                 else:
-                    dlogits, _ = draft_model(cur, True)
+                    dlogits, _ = draft_model(cur, kv_cached=True)
                 dnext = self._apply_temp_topk(dlogits[:, -1, :], temperature, do_sample, top_k)
                 draft_tokens.append(dnext)
                 cur = dnext
@@ -531,11 +544,11 @@ class GPT(nn.Module):
                 full_seq = torch.cat([idx, draft_tokens], dim=1)
                 if full_seq.size(1) > self.block_size:
                     full_seq = full_seq[:, -self.block_size:]
-                vlogits, _ = self(full_seq, False)
+                vlogits, _ = self(full_seq, kv_cached=False)
                 verify_logits = vlogits[:, -(g + 1):, :]
             else:
                 verify_in = torch.cat([idx[:, -1:], draft_tokens], dim=1)
-                verify_logits, _ = self(verify_in, True)
+                verify_logits, _ = self(verify_in, kv_cached=True)
 
             num_accepted = 0
             correction = None
@@ -564,6 +577,7 @@ class GPT(nn.Module):
             total_proposed += g
             total_accepted += num_accepted
             accepted_per_round.append(num_accepted)
+            g_per_round.append(g)
 
             took = num_accepted + 1
             if took > max_new_tokens:
@@ -585,7 +599,7 @@ class GPT(nn.Module):
                 # running sequence -- corrupting its future proposals (and therefore the
                 # measured accept rate) while never affecting final output correctness,
                 # since the target verifies independently. Sync it before rolling back.
-                draft_model(draft_tokens[:, -1:], True)
+                draft_model(draft_tokens[:, -1:], kv_cached=True)
             if not self.vanilla:
                 self.rollback_kv_cache(L0 + num_accepted)
             if not draft_model.vanilla:
@@ -612,6 +626,7 @@ class GPT(nn.Module):
                 'accepted_fraction': accepted_fraction,
                 'expected_accepted_per_round': expected_accepted_per_round,
                 'accepted_per_round': accepted_per_round,
+                'g_per_round': g_per_round,
                 'rounds': len(accepted_per_round),
                 # kept only for backward compatibility with existing call sites; this is
                 # accepted_fraction, NOT the analytical model's alpha -- see above.
